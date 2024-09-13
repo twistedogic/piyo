@@ -20,32 +20,36 @@ type Log struct {
 }
 
 type WAL struct {
-	mu *sync.Mutex
-	f  *os.File
+	path string
+	mu   *sync.Mutex
+	f    *os.File
 }
 
-func NewWAL(name string) (WAL, error) {
-	f, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE, 0644)
-	return WAL{
-		mu: &sync.Mutex{},
-		f:  f,
-	}, err
+func NewWAL(name string) (*WAL, error) {
+	wal := &WAL{
+		path: name,
+		mu:   &sync.Mutex{},
+	}
+	if err := wal.Compact(); err != nil {
+		return nil, err
+	}
+	return wal, nil
 }
 
-func (w WAL) Append(l Log) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return json.NewEncoder(w.f).Encode(l)
-}
-
-func (w WAL) Compact() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	info, err := w.f.Stat()
+func (w *WAL) open() error {
+	f, err := os.OpenFile(w.path, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return err
 	}
-	size := info.Size()
+	w.f = f
+	return nil
+}
+
+func (w *WAL) Stream() (*eventStream, error) {
+	// move offset to beginning of file
+	if _, err := w.f.Seek(0, 0); err != nil {
+		return nil, err
+	}
 	dec := json.NewDecoder(w.f)
 	stream := NewEventStream()
 	for {
@@ -53,7 +57,7 @@ func (w WAL) Compact() error {
 		if err := dec.Decode(&l); err == io.EOF {
 			break
 		} else if err != nil {
-			return err
+			return nil, err
 		}
 		switch l.Ops {
 		case ADD:
@@ -62,14 +66,64 @@ func (w WAL) Compact() error {
 			stream.delete(l.Event.ID)
 		}
 	}
-	if err := w.f.Truncate(size); err != nil {
+	return stream, nil
+}
+
+func (w *WAL) compact() error {
+	defer w.open()
+	if err := w.f.Sync(); err != nil {
 		return err
 	}
-	enc := json.NewEncoder(w.f)
+	stream, err := w.Stream()
+	if err != nil {
+		return err
+	}
+	if err := w.f.Close(); err != nil {
+		return err
+	}
+	compacted := w.path + ".compact"
+	f, err := os.Create(compacted)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(f)
 	for _, event := range stream.list() {
 		if err := enc.Encode(Log{Ops: ADD, Event: event}); err != nil {
 			return err
 		}
 	}
-	return w.f.Sync()
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(compacted, w.path); err != nil {
+		return err
+	}
+	return nil
 }
+
+func (w *WAL) Append(l Log) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	// move offset to end of file
+	if _, err := w.f.Seek(0, 2); err != nil {
+		return err
+	}
+	return json.NewEncoder(w.f).Encode(l)
+}
+
+func (w *WAL) Compact() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.f == nil {
+		if err := w.open(); err != nil {
+			return err
+		}
+	}
+	return w.compact()
+}
+
+func (w *WAL) Write(e Event) error    { return w.Append(Log{Ops: ADD, Event: e}) }
+func (w *WAL) Delete(id string) error { return w.Append(Log{Ops: DELETE, Event: Event{ID: id}}) }
